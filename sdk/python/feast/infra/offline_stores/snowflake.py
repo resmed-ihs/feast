@@ -152,9 +152,6 @@ class SnowflakeOfflineStore(OfflineStore):
             + '"'
         )
 
-        if data_source.snowflake_options.warehouse:
-            config.offline_store.warehouse = data_source.snowflake_options.warehouse
-
         snowflake_conn = get_snowflake_conn(config.offline_store)
 
         start_date = start_date.astimezone(tz=utc)
@@ -204,9 +201,6 @@ class SnowflakeOfflineStore(OfflineStore):
             + '", "'.join(join_key_columns + feature_name_columns + [timestamp_field])
             + '"'
         )
-
-        if data_source.snowflake_options.warehouse:
-            config.offline_store.warehouse = data_source.snowflake_options.warehouse
 
         snowflake_conn = get_snowflake_conn(config.offline_store)
 
