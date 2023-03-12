@@ -271,32 +271,65 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
 
             fv_latest_values_sql = offline_job.to_sql()
 
+            # Determine payload size if writing to an external online store
+            if self.repo_config.online_store.type != "snowflake.online":
+                if feature_view.entity_columns:
+                    join_keys = [entity.name for entity in feature_view.entity_columns]
+                    unique_entities = '"' + '", "'.join(join_keys) + '"'
+
+                    query = f"""
+                        SELECT
+                            COUNT(DISTINCT {unique_entities})
+                        FROM
+                            {feature_view.batch_source.get_table_query_string()}
+                    """
+
+                    with get_snowflake_conn(self.repo_config.offline_store) as conn:
+                        rows_to_write = conn.cursor().execute(query).fetchall()[0][0]
+            else:
+                rows_to_write = 1  # entityless feature view has a placeholder entity
+
             if feature_view.batch_source.field_mapping is not None:
                 fv_latest_mapped_values_sql = _run_snowflake_field_mapping(
                     fv_latest_values_sql, feature_view.batch_source.field_mapping
                 )
 
-            fv_to_proto_sql = self.generate_snowflake_materialization_query(
-                self.repo_config,
-                fv_latest_mapped_values_sql,
-                feature_view,
-                project,
-            )
+            features_full_list = feature_view.features
+            feature_batches = [
+                features_full_list[i : i + 100]
+                for i in range(0, len(features_full_list), 100)
+            ]
 
-            if self.repo_config.online_store.type == "snowflake.online":
-                self.materialize_to_snowflake_online_store(
-                    self.repo_config,
-                    fv_to_proto_sql,
-                    feature_view,
-                    project,
-                )
-            else:
-                self.materialize_to_external_online_store(
-                    self.repo_config,
-                    fv_to_proto_sql,
-                    feature_view,
-                    tqdm_builder,
-                )
+            click.echo(
+                f"""
+    Materializing {Style.BRIGHT + Fore.GREEN}{len(features_full_list)}{Style.RESET_ALL} feature(s) in {Style.BRIGHT + Fore.GREEN}{len(feature_batches)}{Style.RESET_ALL} compute batch(es). There are {Style.BRIGHT + Fore.GREEN}{rows_to_write}{Style.RESET_ALL} unique entity(ies) per feature.
+    {Style.BRIGHT + Fore.GREEN}{len(feature_batches)}{Style.RESET_ALL} batch(es) * {Style.BRIGHT + Fore.GREEN}{rows_to_write}{Style.RESET_ALL} unique entity(ies) = {Style.BRIGHT + Fore.GREEN}{rows_to_write*len(feature_batches)}{Style.RESET_ALL} records written. ({Style.BRIGHT + Fore.GREEN}{rows_to_write*len(features_full_list)}{Style.RESET_ALL} total rows in table)
+                """
+            )
+            with tqdm_builder(rows_to_write * len(feature_batches)) as pbar:
+                for i, feature_batch in enumerate(feature_batches):
+                    fv_to_proto_sql = self.generate_snowflake_materialization_query(
+                        self.repo_config,
+                        fv_latest_mapped_values_sql,
+                        feature_view,
+                        feature_batch,
+                        project,
+                    )
+
+                    if self.repo_config.online_store.type == "snowflake.online":
+                        self.materialize_to_snowflake_online_store(
+                            self.repo_config,
+                            fv_to_proto_sql,
+                            feature_view,
+                            project,
+                        )
+                    else:
+                        self.materialize_to_external_online_store(
+                            self.repo_config,
+                            fv_to_proto_sql,
+                            feature_view,
+                            pbar,
+                        )
 
             return SnowflakeMaterializationJob(
                 job_id=job_id, status=MaterializationJobStatus.SUCCEEDED
@@ -311,6 +344,7 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
         repo_config: RepoConfig,
         fv_latest_mapped_values_sql: str,
         feature_view: Union[BatchFeatureView, FeatureView],
+        feature_batch: list,
         project: str,
     ) -> str:
 
@@ -333,7 +367,7 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
         UDF serialization function.
         """
         feature_sql_list = []
-        for feature in feature_view.features:
+        for feature in feature_batch:
             feature_value_type_name = feature.dtype.to_value_type().name
 
             feature_sql = _convert_value_name_to_snowflake_udf(
@@ -441,7 +475,7 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
         repo_config: RepoConfig,
         materialization_sql: str,
         feature_view: Union[StreamFeatureView, FeatureView],
-        tqdm_builder: Callable[[int], tqdm],
+        pbar: tqdm,
     ) -> None:
 
         feature_names = [feature.name for feature in feature_view.features]
@@ -450,10 +484,6 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
             query = materialization_sql
             cursor = execute_snowflake_statement(conn, query)
             for i, df in enumerate(cursor.fetch_pandas_batches()):
-                click.echo(
-                    f"Snowflake: Processing Materialization ResultSet Batch #{i+1}"
-                )
-
                 entity_keys = (
                     df["entity_key"].apply(EntityKeyProto.FromString).to_numpy()
                 )
@@ -489,11 +519,10 @@ class SnowflakeMaterializationEngine(BatchMaterializationEngine):
                     )
                 )
 
-                with tqdm_builder(len(rows_to_write)) as pbar:
-                    self.online_store.online_write_batch(
-                        repo_config,
-                        feature_view,
-                        rows_to_write,
-                        lambda x: pbar.update(x),
-                    )
+                self.online_store.online_write_batch(
+                    repo_config,
+                    feature_view,
+                    rows_to_write,
+                    lambda x: pbar.update(x),
+                )
         return None
